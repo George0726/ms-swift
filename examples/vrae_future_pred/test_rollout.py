@@ -343,6 +343,37 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(backbone.calls, 3)
         self.assertEqual(backbone.last_seq_len, 3 + 6)
 
+    def test_scheme_c_final_loss_reaches_first_delta(self):
+        for depth, crosses in ((3, True), (1, False)):
+            with self.subTest(bptt_depth=depth):
+                model, _ = self.interleave_predictor(
+                    rollout_weight=1., residual_feedback=True, bptt_depth=depth)
+                model.train()
+                seen = []
+                def keep(module, args, output):
+                    output.retain_grad()
+                    seen.append(output)
+                model.latent_head.register_forward_hook(keep)
+                inputs = self.interleave_inputs()
+                out = model(**inputs)
+                model.latent_losses(out.z_pred[:, -1:],
+                                    inputs['target_latent'][:, -1:])['loss'].backward()
+                grad = seen[0].grad
+                nonzero = grad is not None and grad.abs().sum().item() > 0
+                self.assertEqual(nonzero, crosses)
+
+    def test_scheme_c_training_predictions_do_not_read_future_targets(self):
+        model, _ = self.interleave_predictor(rollout_weight=1., residual_feedback=True)
+        model.train()
+        inputs = self.interleave_inputs()
+        torch.manual_seed(42)
+        first = model(**inputs)
+        inputs['target_latent'] = inputs['target_latent'] + 100
+        torch.manual_seed(42)
+        second = model(**inputs)
+        torch.testing.assert_close(first.z_pred, second.z_pred)
+        self.assertFalse(torch.isclose(first.loss, second.loss).item())
+
     def test_interleave_feeds_the_previous_chunk_not_a_learned_constant(self):
         # Feeding the observed chunk in must actually change the prediction -- otherwise
         # the latent positions are just `direct` with a coarser grid.
