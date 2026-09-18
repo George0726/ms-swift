@@ -138,6 +138,7 @@ def build_jsonl(
                 },
             ],
             'videos': [str(clip)],
+            'context_latent_path': str(root / record['first_half']) if record.get('first_half') else None,
             'target_latent_path': str(target),
             'grid_hw': [grid_height, grid_width],
             # Qwen2VLTemplate.replace_tag merges chat_template_kwargs straight into the
@@ -199,6 +200,7 @@ class VRAEFuturePreprocessor(RowPreprocessor):
             'messages': row['messages'],
             'videos': videos,
             'target_latent_path': target,
+            'context_latent_path': row.get('context_latent_path'),
             'grid_hw': row.get('grid_hw'),
             # Drives qwen_vl_utils.fetch_video; losing it silently changes the frames
             # and resolution Qwen sees relative to what V-RAE encoded.

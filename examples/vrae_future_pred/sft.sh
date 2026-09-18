@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # Train Qwen3.5 -> V-RAE latent future prediction.
 #
-#   sh examples/vrae_future_pred/sft.sh
+#   bash <this-dir>/sft.sh
 #
-# Prerequisites:
+# Run the copy that sits next to the model.py you mean to train; the plugins are loaded
+# from this script's own directory (PLUGIN_DIR below), so the two can never disagree.
+#
+# Prerequisites (all paths relative to this script's directory):
 #   1. Latent cache built WITH context clips:
 #        python /data1/qirui/V-RAE/scripts/build_vpdata_latents.py --context-clip
-#   2. jsonl splits:
-#        python examples/vrae_future_pred/dataset.py --cache-root "$VPDATA_LATENT_ROOT" --build
+#   2. jsonl splits (carries context_latent_path, required by autoregressive mode):
+#        python <this-dir>/dataset.py --cache-root "$VPDATA_LATENT_ROOT" --build
 #   3. Latent statistics:
-#        python examples/vrae_future_pred/latent_stats.py \
+#        python <this-dir>/latent_stats.py \
 #            --cache-root "$VPDATA_LATENT_ROOT" --out "$LATENT_STATS_PATH"
 set -euo pipefail
 
 SWIFT_ROOT=${SWIFT_ROOT:-/data1/qirui/ms-swift}
+# Load the plugins from the tree THIS script lives in, never from a hardcoded
+# examples/ path. This file has been copied to a sibling directory, and the copy went on
+# loading the original examples/ plugins -- which have no `prediction_mode` at all, so
+# PREDICTION_MODE=autoregressive was accepted, ignored, and the run trained one_shot
+# without a word of complaint. Same failure class as the lowercase-env-var bug below:
+# it runs, it does not error, and the configuration is not the one you asked for.
+PLUGIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PY=${PY:-/home/node-user/anaconda3/envs/vrae_swift/bin/python}
 # sdpa because flash_attn is not installed in this env; set ATTN_IMPL=flash_attn after
 # installing a wheel built for torch 2.12 / cu126 if the speedup is worth it.
@@ -35,6 +45,97 @@ export LATENT_CHUNKS=${LATENT_CHUNKS:-${latent_chunks:-10}}
 export LATENT_HEIGHT=${LATENT_HEIGHT:-${latent_height:-16}}
 export LATENT_WIDTH=${LATENT_WIDTH:-${latent_width:-28}}
 export LATENT_DIM=${LATENT_DIM:-${latent_dim:-1024}}
+
+# WHERE the future positions live: `resampler` cross-attends learned queries to Qwen's
+# hidden states outside the backbone; `direct` packs them into Qwen's own sequence so they
+# pass through all 32 layers. Two different axes with confusingly similar names --
+# FUTURE_PREDICTOR_MODE is *where*, PREDICTION_MODE below is *one-shot vs rollout*.
+export FUTURE_PREDICTOR_MODE=${FUTURE_PREDICTOR_MODE:-resampler}
+
+# one_shot preserves the original all-horizons head. autoregressive shares a single
+# one-chunk transition across horizons and feeds its own output back in.
+# Weight 0 = B (teacher forcing), 1 = C, intermediate = weighted two-branch loss.
+export PREDICTION_MODE=${PREDICTION_MODE:-one_shot}
+export ROLLOUT_WEIGHT=${ROLLOUT_WEIGHT:-1.0}
+
+# ROLLOUT_STEPS truncates the HORIZON (train/eval only the first K chunks), so a K < 10
+# run's loss is not comparable to a 10-chunk one -- keep it at LATENT_CHUNKS except for
+# short debug runs. BPTT_DEPTH is the knob the experiment plan's A2/A3/A4 actually want:
+# roll all the horizons, but detach feedback older than d steps. d >= LATENT_CHUNKS is
+# full BPTT (A4); d=2 and d=5 are A2 and A3, all at the same horizon count and therefore
+# all comparable to each other and to the one-shot A0 baseline.
+export ROLLOUT_STEPS=${ROLLOUT_STEPS:-${LATENT_CHUNKS}}
+export BPTT_DEPTH=${BPTT_DEPTH:-${LATENT_CHUNKS}}
+
+# Predict Z_k = Z_{k-1} + delta instead of Z_k outright, with the head's output weight
+# zero-initialised. That makes the transition the identity at step 0, so the rollout
+# starts out *being* the persistence baseline (0.5144 train / 0.5410 val on trunk0)
+# rather than the predict-dataset-mean point (~1.16). Without it, feeding the observed
+# chunk in buys nothing at initialisation -- there is no path from input to output.
+export RESIDUAL_FEEDBACK=${RESIDUAL_FEEDBACK:-1}
+
+# Add e_t(t_k) to the rollout queries. Off means the transition is time-invariant
+# (z <- f(z; C)): principled as a dynamics operator and a prerequisite for a variable
+# horizon, but it cannot tell step 1 from step 9 on a near-static clip. Ablate it.
+export AR_TIME_EMBED=${AR_TIME_EMBED:-0}
+
+case "${FUTURE_PREDICTOR_MODE}" in
+    direct|resampler|slice|interleave) ;;
+    *) echo "FUTURE_PREDICTOR_MODE must be direct, resampler, slice or interleave" >&2; exit 2 ;;
+esac
+# interleave: per-chunk grid of latent positions that actually enter Qwen's sequence.
+# 8x14 = 112 per chunk adds 1120 tokens and a 16.8 M expansion; 4x4 = 16 adds 160 tokens
+# and needs 117 M. Must divide the latent grid.
+export LATENT_SEQ_H=${LATENT_SEQ_H:-8}
+export LATENT_SEQ_W=${LATENT_SEQ_W:-14}
+# What is fed back into the next chunk's positions.
+#   latent  the predicted V-RAE latent, pooled + projected back to D_qwen. Teacher-
+#           forceable, so training is ONE forward -- but the feedback passes two lossy
+#           bottlenecks (4096->1024 and 448->112).
+#   hidden  the previous block's hidden states straight back in, no bottleneck. This is
+#           what Future-L1 does. NOT teacher-forceable here: our target is a V-RAE latent,
+#           not a backbone embedding, so no ground-truth hidden state exists to feed. It
+#           therefore costs one Qwen forward per chunk -- pair it with a small BPTT_DEPTH.
+export INTERLEAVE_FEEDBACK=${INTERLEAVE_FEEDBACK:-latent}
+case "${INTERLEAVE_FEEDBACK}" in
+    latent|hidden) ;;
+    *) echo "INTERLEAVE_FEEDBACK must be latent or hidden" >&2; exit 2 ;;
+esac
+if [ "${INTERLEAVE_FEEDBACK}" = hidden ] && [ "${ROLLOUT_WEIGHT}" != 1.0 ] \
+       && [ "${ROLLOUT_WEIGHT}" != 1 ]; then
+    echo "INTERLEAVE_FEEDBACK=hidden requires ROLLOUT_WEIGHT=1 (no teacher forcing possible)" >&2
+    exit 2
+fi
+if [ "${FUTURE_PREDICTOR_MODE}" = interleave ] && [ "${PREDICTION_MODE}" != autoregressive ]; then
+    echo "FUTURE_PREDICTOR_MODE=interleave requires PREDICTION_MODE=autoregressive" >&2
+    exit 2
+fi
+# Predicted feedback needs one backbone pass per chunk; teacher forcing needs one in
+# total. For interleave that is a 10x difference in step time, so warn rather than let it
+# be discovered from the ETA.
+if [ "${FUTURE_PREDICTOR_MODE}" = interleave ] && [ "${ROLLOUT_WEIGHT}" != 0 ]; then
+    echo "note: interleave with ROLLOUT_WEIGHT=${ROLLOUT_WEIGHT} runs the rollout branch," \
+         "which costs one Qwen forward per chunk (~10x a teacher-forced step)." \
+         "ROLLOUT_WEIGHT=0 trains in a single pass; eval always rolls out regardless." >&2
+fi
+# slice reads Qwen's existing video-token hidden states, so it needs to know how many
+# temporal positions the vision tower produced: nframes / temporal_patch_size. For this
+# cache that is 40 / 2 = 20. The model validates it against the real video_grid_thw.
+export CONTEXT_SLICES=${CONTEXT_SLICES:-20}
+if [ "${PREDICTION_MODE}" != one_shot ] && [ "${PREDICTION_MODE}" != autoregressive ]; then
+    echo "PREDICTION_MODE must be one_shot or autoregressive" >&2
+    exit 2
+fi
+# The whole-module copies PEFT must keep alongside the LoRA deltas. Naming the wrong one
+# trains a module that is never saved, which only shows up when the checkpoint is loaded
+# and scores like an untrained head. `direct` has no resampler; the rollout's feedback
+# projection lives inside the resampler and rides along with it.
+case "${FUTURE_PREDICTOR_MODE}" in
+    direct)     MODULES_TO_SAVE=(future_embeddings latent_head) ;;
+    slice)      MODULES_TO_SAVE=(slice_expand latent_head) ;;
+    interleave) MODULES_TO_SAVE=(interleave latent_head) ;;
+    *)          MODULES_TO_SAVE=(resampler latent_head) ;;
+esac
 
 # Predictor shape. RESAMPLER_SELF_ATTN=0 is the weak-resampler ablation: queries stop
 # attending to each other, so joint reasoning over future positions can only happen
@@ -84,9 +185,9 @@ echo "ranks ${NPROC_PER_NODE} x per_device ${PER_DEVICE} x accum ${GRAD_ACCUM} =
 cd "${SWIFT_ROOT}"
 
 "${PY}" -m swift.cli.main sft \
-    --external_plugins examples/vrae_future_pred/dataset.py \
-                       examples/vrae_future_pred/template.py \
-                       examples/vrae_future_pred/model.py \
+    --external_plugins "${PLUGIN_DIR}/dataset.py" \
+                       "${PLUGIN_DIR}/template.py" \
+                       "${PLUGIN_DIR}/model.py" \
     --model /GPFS/ComfyUI_models/LLM/Qwen3.5-9B \
     --model_type qwen3_5_vrae \
     --template qwen3_5_vrae \
@@ -97,7 +198,7 @@ cd "${SWIFT_ROOT}"
     --lora_rank 32 \
     --lora_alpha 64 \
     --freeze_vit true \
-    --modules_to_save resampler latent_head \
+    --modules_to_save "${MODULES_TO_SAVE[@]}" \
     --torch_dtype bfloat16 \
     --attn_impl "${ATTN_IMPL:-sdpa}" \
     --per_device_train_batch_size "${PER_DEVICE}" \

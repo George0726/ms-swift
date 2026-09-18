@@ -21,6 +21,7 @@ Three overrides matter here:
 """
 
 
+import os
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -29,6 +30,11 @@ from swift.template import StdTemplateInputs, register_template
 from swift.template.templates.qwen import Qwen3_5Template, QwenTemplateMeta
 
 TEMPLATE_TYPE = 'qwen3_5_vrae'
+
+
+def _paired_residual() -> bool:
+    """Read at encode time, not import time: eval scripts set the env after importing."""
+    return os.environ.get('PREDICTION_MODE', '').strip().lower() == 'paired_residual'
 
 
 class Qwen35VRAETemplate(Qwen3_5Template):
@@ -66,6 +72,14 @@ class Qwen35VRAETemplate(Qwen3_5Template):
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
         extra = getattr(inputs, 'extra_kwargs', None) or {}
+        context_path = extra.get('context_latent_path')
+        if context_path:
+            context = self._load_target_latent(str(context_path))
+            # A rollout only ever reads the final observed chunk, so shipping one chunk
+            # keeps 9/10 of this tensor out of every batch. paired_residual needs the
+            # whole thing: its residual base is chunk k, not the last chunk. Keyed off
+            # PREDICTION_MODE rather than a separate flag so the two cannot disagree.
+            encoded['context_latent'] = context if _paired_residual() else context[-1:]
         path = extra.get('target_latent_path')
         if path:
             encoded['target_latent'] = self._load_target_latent(str(path))
@@ -78,6 +92,8 @@ class Qwen35VRAETemplate(Qwen3_5Template):
         res = super()._data_collator(batch, padding_to=padding_to)
         latents = [b['target_latent'] for b in batch if b.get('target_latent') is not None]
         if latents:
+            if len(latents) != len(batch):
+                raise ValueError('target_latent missing from part of batch')
             shapes = {tuple(latent.shape) for latent in latents}
             if len(shapes) > 1:
                 raise ValueError(f'target latents in one batch must share a shape, got {sorted(shapes)}')
@@ -85,6 +101,11 @@ class Qwen35VRAETemplate(Qwen3_5Template):
             grid_hw = next((b.get('grid_hw') for b in batch if b.get('grid_hw') is not None), None)
             if grid_hw is not None:
                 res['grid_hw'] = torch.tensor(grid_hw, dtype=torch.long)
+        contexts = [b.get('context_latent') for b in batch]
+        if any(c is not None for c in contexts):
+            if any(c is None for c in contexts) or len({tuple(c.shape) for c in contexts}) != 1:
+                raise ValueError('context_latent must be present with identical shapes across batch')
+            res['context_latent'] = torch.stack(contexts)
         return res
 
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,9 +116,18 @@ class Qwen35VRAETemplate(Qwen3_5Template):
         # third key whitelist on the path, after the collator's gather_keys and the
         # dataset loader's remove_useless_columns.
         res = super()._post_encode(model, inputs)
-        for key in ('target_latent', 'grid_hw'):
+        for key in ('target_latent', 'context_latent', 'grid_hw'):
             if key in inputs and key not in res:
                 res[key] = inputs[key]
+        # Where the video tokens sit in the sequence. The `slice` predictor reads the
+        # hidden states Qwen produced at those positions, and by this point the model
+        # only receives `inputs_embeds` -- `input_ids` exists here and nowhere downstream,
+        # so the mask has to be built now. Same test the backbone itself uses to scatter
+        # the vision embeddings (swift/template/base.py:2373).
+        ids = inputs.get('input_ids')
+        video_token_id = getattr(getattr(model, 'config', None), 'video_token_id', None)
+        if ids is not None and video_token_id is not None and 'video_token_mask' not in res:
+            res['video_token_mask'] = ids == video_token_id
         return res
 
     # The three terms the model already computes but nothing logs: only the combined
@@ -124,6 +154,8 @@ class Qwen35VRAETemplate(Qwen3_5Template):
                 value = getattr(outputs, name, None)
                 if value is not None:
                     metrics[name].update(value)
+            for name, value in (getattr(outputs, 'rollout_metrics', None) or {}).items():
+                metrics[name].update(value.detach())
         return outputs
 
 

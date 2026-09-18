@@ -26,6 +26,15 @@ from typing import List, Optional
 
 import torch
 
+# Running this as a script puts *this* directory on sys.path, not the repo root, so
+# `import swift` inside load_predictor() fails unless PYTHONPATH happened to be set --
+# and it fails only after the 19 GB backbone path is already reached. Same two entries
+# eval_latent.py adds, for the same reason.
+HERE = Path(__file__).resolve().parent
+for candidate in (str(HERE.parent.parent), str(HERE)):
+    if candidate not in sys.path:
+        sys.path.insert(0, candidate)
+
 DEFAULT_VRAE_ROOT = '/data1/qirui/V-RAE'
 
 

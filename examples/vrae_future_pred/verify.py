@@ -65,18 +65,66 @@ def check_checkpoint(checkpoint: Path) -> int:  # noqa: C901
         resampler_depth=get_env_args('resampler_depth', int, 4),
         resampler_heads=get_env_args('resampler_heads', int, 16),
         resampler_self_attn=bool(get_env_args('resampler_self_attn', int, 1)),
+        predictor_mode=os.environ.get('FUTURE_PREDICTOR_MODE', 'resampler').lower(),
+        prediction_mode=os.environ.get('PREDICTION_MODE', 'one_shot').lower(),
+        ar_time_embed=bool(get_env_args('ar_time_embed', int, 0)),
+        context_slices=get_env_args('context_slices', int, 20),
+        latent_seq_h=get_env_args('latent_seq_h', int, 8),
+        latent_seq_w=get_env_args('latent_seq_w', int, 14),
+        feedback_source=os.environ.get('INTERLEAVE_FEEDBACK', 'latent').lower(),
     )
-    reference = vrae_model.SpatiotemporalLatentResampler(
-        context_dim=4096, dim=config.resampler_dim,
-        grid=(config.latent_chunks, config.latent_height, config.latent_width),
-        depth=config.resampler_depth, num_heads=config.resampler_heads,
-        self_attn=config.resampler_self_attn)
+    # A rollout emits one chunk per step, so its resampler holds a single time slice
+    # rather than all T_c -- roughly a tenth of the query embeddings. Getting this wrong
+    # would report a false FAIL on every autoregressive checkpoint.
+    rollout = config.prediction_mode == 'autoregressive'
+    grid = (config.latent_chunks, config.latent_height, config.latent_width)
+    if config.predictor_mode == 'direct':
+        predictor_name = 'future_embeddings'
+        reference = vrae_model.StructuredFutureEmbeddings(4096, grid)
+        head_dim = 4096
+    elif config.predictor_mode == 'interleave':
+        predictor_name = 'interleave'
+        reference = vrae_model.InterleavedLatentTokens(
+            context_dim=4096, latent_dim=config.latent_dim, dim=config.resampler_dim,
+            chunks=config.latent_chunks,
+            seq_grid=(config.latent_seq_h, config.latent_seq_w),
+            latent_grid=(config.latent_height, config.latent_width),
+            feedback_source=config.feedback_source)
+        head_dim = config.resampler_dim
+    elif config.predictor_mode == 'slice':
+        predictor_name = 'slice_expand'
+        merge = get_env_args('spatial_merge_size', int, 2)
+        reference = vrae_model.ContextSliceExpansion(
+            context_dim=4096, dim=config.resampler_dim,
+            slices_per_chunk=config.context_slices // config.latent_chunks,
+            merge_size=merge)
+        head_dim = config.resampler_dim
+    else:
+        predictor_name = 'resampler'
+        reference = vrae_model.SpatiotemporalLatentResampler(
+            context_dim=4096, dim=config.resampler_dim,
+            grid=(1, config.latent_height, config.latent_width) if rollout else grid,
+            depth=config.resampler_depth, num_heads=config.resampler_heads,
+            self_attn=config.resampler_self_attn)
+        head_dim = config.resampler_dim
     expected = {
-        'resampler': sum(t.numel() for t in reference.parameters()) / 1e6,
+        predictor_name: sum(t.numel() for t in reference.parameters()) / 1e6,
         'latent_head': sum(t.numel() for t in vrae_model.LatentHead(
-            config.resampler_dim, config.latent_dim).parameters()) / 1e6,
+            head_dim, config.latent_dim).parameters()) / 1e6,
     }
-    print(f'  config: depth {config.resampler_depth}, self_attn {config.resampler_self_attn}, '
+    if rollout:
+        # The feedback projection is what makes a rollout a rollout. It is attached to
+        # whichever module modules_to_save keeps, so it is counted under that name -- and
+        # if it is missing, the checkpoint cannot roll out at all.
+        # interleave has no separate feedback projection: feeding the previous chunk in as
+        # an input embedding *is* its feedback, and in_proj is already counted above.
+        if config.predictor_mode != 'interleave':
+            host = 'latent_head' if config.predictor_mode == 'direct' else predictor_name
+            expected[host] += (config.latent_dim * head_dim + head_dim) / 1e6
+        if config.ar_time_embed and config.predictor_mode == 'resampler':
+            expected[predictor_name] += config.latent_chunks * config.resampler_dim / 1e6
+    print(f'  config: predictor {config.predictor_mode}, prediction {config.prediction_mode}, '
+          f'depth {config.resampler_depth}, self_attn {config.resampler_self_attn}, '
           f'dim {config.resampler_dim}')
 
     failures = []
@@ -89,8 +137,10 @@ def check_checkpoint(checkpoint: Path) -> int:  # noqa: C901
         if not ok:
             failures.append(name)
     if failures:
-        print(f'\n{failures} absent from the checkpoint: the run trained LoRA only. '
-              f'Use --modules_to_save resampler latent_head, not --trainable_parameters.')
+        print(f'\n{failures} absent or short in the checkpoint. Either the run trained '
+              f'LoRA only -- use `--modules_to_save {predictor_name} latent_head`, not '
+              f'--trainable_parameters -- or it ran in a different mode than this check: '
+              f'export the same FUTURE_PREDICTOR_MODE / PREDICTION_MODE the run used.')
         return 1
     print('\nthe new modules were trained')
     return 0

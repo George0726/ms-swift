@@ -25,6 +25,12 @@
 #   plateau at 0.3-0.6             capacity or optimization. Try resampler_depth 6-8 /
 #                                  resampler_dim 1280, or a higher LR, before blaming
 #                                  the data.
+#
+# PREDICTION_MODE=autoregressive reads differently at the start: the residual rollout is
+# initialised as the identity, so it opens at the *persistence* loss (~0.57 on trunk0
+# train samples), not at ~1.19. "Nothing is learning" therefore looks like a plateau at
+# ~0.57 here, and 1.19 would instead mean the residual path is not wired up at all.
+# The gate itself is unchanged: 8 samples with regularization off must still reach < 0.1.
 set -euo pipefail
 
 SWIFT_ROOT=${SWIFT_ROOT:-/data1/qirui/ms-swift}
@@ -67,7 +73,7 @@ export GLOBAL_BATCH=${GLOBAL_BATCH:-${NUM_SAMPLES}}
 #   --split_dataset_ratio 0 do not carve a val split out of 8 samples
 VPDATA_LATENT_ROOT="${OVERFIT_ROOT}" \
 LATENT_STATS_PATH=${LATENT_STATS_PATH:-${SWIFT_ROOT}/ckpts/latent_stats/vjepa_vpdata_40future.pt} \
-    bash "${SWIFT_ROOT}/examples/vrae_future_pred/sft.sh" \
+    bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/sft.sh" \
     --max_steps "${MAX_STEPS:-1500}" \
     --learning_rate "${LR:-3e-4}" \
     --lr_scheduler_type constant \
