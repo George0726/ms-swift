@@ -138,6 +138,50 @@ class RolloutTests(unittest.TestCase):
         torch.testing.assert_close(out.loss, model.latent_losses(reference, self.inputs['target_latent'])['loss'])
         self.assertFalse(hasattr(model.resampler, 'feedback_proj'))
 
+    def test_variable_direct_horizon_and_loss(self):
+        model = predictor(mode='one_shot', predictor_mode='direct', backbone=DirectBackbone()).eval()
+        inputs = dict(self.inputs)
+        inputs['inputs_embeds'] = torch.randn(2, 3, 8)
+        inputs.pop('input_ids')
+        for k in (1, 2, 3):
+            model.qwen.calls = 0
+            out = model(**inputs, num_future_chunks=k)
+            self.assertEqual(tuple(out.z_pred.shape), (2, k, 2, 4))
+            self.assertEqual(model.qwen.calls, 1)
+            self.assertEqual(model.qwen.last_seq_len,
+                             int(inputs['attention_mask'].sum(1).max()) + k * 2)
+            torch.testing.assert_close(out.loss, model.latent_losses(
+                out.z_pred, inputs['target_latent'][:, :k])['loss'])
+            if k == 1:
+                self.assertEqual(out.loss_temp.item(), 0.)
+        inputs.pop('target_latent')
+        self.assertEqual(model(**inputs, num_future_chunks=2).z_pred.shape[1], 2)
+        self.assertEqual(model(**inputs).z_pred.shape[1], 3)
+        for k in (0, 4, -1, 1.5, True):
+            with self.assertRaises(ValueError):
+                model(**inputs, num_future_chunks=k)
+
+    def test_variable_direct_training_sampling_and_time_gradients(self):
+        model = predictor(mode='one_shot', predictor_mode='direct', backbone=DirectBackbone())
+        model.vrae_config.direct_train_min_chunks = 1
+        inputs = dict(self.inputs)
+        inputs['inputs_embeds'] = torch.randn(2, 3, 8)
+        inputs.pop('input_ids')
+        from unittest.mock import patch
+        with patch.object(torch, 'randint', return_value=torch.tensor(2)):
+            out = model(**inputs)
+        self.assertEqual(out.z_pred.shape[1], 2)
+        out.loss.backward()
+        grad = model.future_embeddings.time_embed.grad
+        self.assertGreater(grad[:2].abs().sum().item(), 0)
+        self.assertEqual(grad[2:].abs().sum().item(), 0)
+        model.eval()
+        self.assertEqual(model(**inputs).z_pred.shape[1], 3)
+        inputs['target_latent'] = inputs['target_latent'][:, :1]
+        self.assertEqual(model(**inputs).z_pred.shape[1], 1)
+        with self.assertRaises(ValueError):
+            model(**inputs, num_future_chunks=2)
+
     def test_direct_one_shot_unchanged(self):
         # Guards the merge: direct one-shot is the strongest baseline measured and a run
         # is training against it, so its arithmetic must stay exactly what it was before
@@ -593,12 +637,16 @@ class TemplateTests(unittest.TestCase):
             latent = torch.randn(3,2,4)
             torch.save({'latent': latent}, path)
             encoded = tpl._encode(types.SimpleNamespace(extra_kwargs={
-                'context_latent_path': path, 'target_latent_path': path, 'grid_hw': [1,2]}))
+                'context_latent_path': path, 'target_latent_path': path, 'grid_hw': [1,2],
+                'num_future_chunks': 2}))
             torch.testing.assert_close(encoded['context_latent'], latent[-1:])
             batch = tpl._data_collator([encoded, encoded])
             self.assertEqual(batch['context_latent'].shape, (2,1,2,4))
             restored = tpl._post_encode(None, batch)
             self.assertIs(restored['context_latent'], batch['context_latent'])
+            self.assertEqual(restored['num_future_chunks'], 2)
+            with self.assertRaises(ValueError):
+                tpl._data_collator([encoded, {**encoded, 'num_future_chunks': 1}])
             with self.assertRaises(ValueError):
                 tpl._data_collator([encoded, {'labels': [1]}])
             # paired_residual needs every context chunk, not just the last observed one

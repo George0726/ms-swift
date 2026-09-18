@@ -72,6 +72,11 @@ class Qwen35VRAETemplate(Qwen3_5Template):
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
         extra = getattr(inputs, 'extra_kwargs', None) or {}
+        if 'num_future_chunks' in extra:
+            value = extra['num_future_chunks']
+            if type(value) is not int or value < 1:
+                raise ValueError('num_future_chunks must be a positive integer')
+            encoded['num_future_chunks'] = value
         context_path = extra.get('context_latent_path')
         if context_path:
             context = self._load_target_latent(str(context_path))
@@ -90,6 +95,11 @@ class Qwen35VRAETemplate(Qwen3_5Template):
 
     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
         res = super()._data_collator(batch, padding_to=padding_to)
+        horizons = [b.get('num_future_chunks') for b in batch]
+        if any(k is not None for k in horizons):
+            if any(type(k) is not int or k < 1 for k in horizons) or len(set(horizons)) != 1:
+                raise ValueError('num_future_chunks must be identical positive integers within a batch')
+            res['num_future_chunks'] = horizons[0]
         latents = [b['target_latent'] for b in batch if b.get('target_latent') is not None]
         if latents:
             if len(latents) != len(batch):
@@ -116,7 +126,7 @@ class Qwen35VRAETemplate(Qwen3_5Template):
         # third key whitelist on the path, after the collator's gather_keys and the
         # dataset loader's remove_useless_columns.
         res = super()._post_encode(model, inputs)
-        for key in ('target_latent', 'context_latent', 'grid_hw'):
+        for key in ('target_latent', 'context_latent', 'grid_hw', 'num_future_chunks'):
             if key in inputs and key not in res:
                 res[key] = inputs[key]
         # Where the video tokens sit in the sequence. The `slice` predictor reads the

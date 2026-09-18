@@ -246,12 +246,15 @@ class StructuredFutureEmbeddings(nn.Module):
         for parameter in (self.base, self.time_embed, self.height_embed, self.width_embed):
             nn.init.trunc_normal_(parameter, std=0.02)
 
-    def forward(self, batch_size: int, *, device, dtype) -> torch.Tensor:
-        time = self.time_embed[:, None, None, :]
+    def forward(self, batch_size: int, *, device, dtype, num_chunks=None) -> torch.Tensor:
+        chunks = self.grid[0] if num_chunks is None else num_chunks
+        if type(chunks) is not int or not 1 <= chunks <= self.grid[0]:
+            raise ValueError("num_chunks must be an integer within the learned time embedding range")
+        time = self.time_embed[:chunks, None, None, :]
         rows = self.height_embed[None, :, None, :]
         cols = self.width_embed[None, None, :, :]
         positions = self.base.view(1, 1, 1, -1) + time + rows + cols
-        positions = positions.reshape(1, self.num_positions, -1)
+        positions = positions.reshape(1, chunks * self.grid[1] * self.grid[2], -1)
         return positions.expand(batch_size, -1, -1).to(device=device, dtype=dtype)
 
 
@@ -482,6 +485,7 @@ class QwenVRAEFuturePredictorConfig(PretrainedConfig):
         latent_seq_h: int = 8,
         latent_seq_w: int = 14,
         feedback_source: str = 'latent',
+        direct_train_min_chunks: int = 0,
         **kwargs,
     ) -> None:
         # Two orthogonal axes whose names are one letter apart, so spell out which is
@@ -553,6 +557,11 @@ class QwenVRAEFuturePredictorConfig(PretrainedConfig):
         #           Future-L1 does, no bottleneck -- but not teacher-forceable here, so
         #           it costs one forward per chunk.
         self.feedback_source = feedback_source
+        if type(direct_train_min_chunks) is not int or not 0 <= direct_train_min_chunks <= latent_chunks:
+            raise ValueError("direct_train_min_chunks must be between 0 and latent_chunks")
+        if direct_train_min_chunks and (predictor_mode != "direct" or prediction_mode != "one_shot"):
+            raise ValueError("variable horizon training requires direct + one_shot")
+        self.direct_train_min_chunks = direct_train_min_chunks
         self.latent_chunks = latent_chunks
         self.latent_height = latent_height
         self.latent_width = latent_width
@@ -703,7 +712,7 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
 
     def _append_future_positions(
         self, inputs_embeds: torch.Tensor, attention_mask: Optional[torch.Tensor],
-        future: Optional[torch.Tensor] = None
+        future: Optional[torch.Tensor] = None, num_future_chunks: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Insert extra positions directly after every sample's valid context.
 
@@ -722,7 +731,8 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
         valid = attention_mask.bool()
         lengths = valid.sum(dim=1)
         if future is None:
-            future = self.future_embeddings(batch, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            future = self.future_embeddings(batch, device=inputs_embeds.device, dtype=inputs_embeds.dtype,
+                                            num_chunks=num_future_chunks)
         num_future = future.shape[1]
         total_length = int(lengths.max().item()) + num_future
         packed = inputs_embeds.new_zeros(batch, total_length, dim)
@@ -1012,6 +1022,7 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
         grid_hw: Optional[torch.Tensor] = None,
         context_latent: Optional[torch.Tensor] = None,
         video_token_mask: Optional[torch.Tensor] = None,
+        num_future_chunks: Optional[int] = None,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -1031,6 +1042,27 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
         # keywords raises "got multiple values for keyword argument".
         kwargs.update({'output_hidden_states': True, 'use_cache': False})
         cfg = self.vrae_config
+        chunks = cfg.latent_chunks
+        variable_direct = cfg.predictor_mode == 'direct' and cfg.prediction_mode == 'one_shot'
+        if num_future_chunks is not None and not variable_direct:
+            raise ValueError('num_future_chunks requires direct + one_shot')
+        if variable_direct:
+            if target_latent is not None:
+                expected_tail = (cfg.latent_height * cfg.latent_width, cfg.latent_dim)
+                if (target_latent.ndim != 4 or tuple(target_latent.shape[2:]) != expected_tail
+                        or not 1 <= target_latent.shape[1] <= cfg.latent_chunks):
+                    raise ValueError('target_latent must be [B, K, H*W, D], 1 <= K <= latent_chunks')
+                chunks = target_latent.shape[1]
+            if num_future_chunks is not None:
+                if type(num_future_chunks) is not int or not 1 <= num_future_chunks <= chunks:
+                    raise ValueError('num_future_chunks must be an integer within target/model horizon')
+                chunks = num_future_chunks
+            elif self.training and target_latent is not None and cfg.direct_train_min_chunks:
+                if chunks < cfg.direct_train_min_chunks:
+                    raise ValueError('target horizon is shorter than direct_train_min_chunks')
+                chunks = int(torch.randint(cfg.direct_train_min_chunks, chunks + 1, ()).item())
+            if target_latent is not None:
+                target_latent = target_latent[:, :chunks]
         if cfg.predictor_mode == 'interleave':
             if kwargs.get('inputs_embeds') is None:
                 raise ValueError('interleave predictor requires inputs_embeds from the template')
@@ -1056,7 +1088,7 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
             if inputs_embeds is None:
                 raise ValueError('direct predictor requires inputs_embeds from the multimodal template')
             kwargs['inputs_embeds'], attention_mask, future_mask = self._append_future_positions(
-                inputs_embeds, attention_mask)
+                inputs_embeds, attention_mask, num_future_chunks=chunks)
             kwargs.pop('position_ids', None)
             kwargs.pop('mm_token_type_ids', None)
         outputs = self.qwen(attention_mask=attention_mask, **kwargs)
@@ -1075,7 +1107,7 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
                 grid_hw.to(hidden.device) == hidden.new_tensor([cfg.latent_height, cfg.latent_width])):
             raise ValueError('grid_hw does not match configured latent spatial grid')
         if target_latent is not None:
-            expected = (hidden.shape[0], cfg.latent_chunks, tokens, cfg.latent_dim)
+            expected = (hidden.shape[0], chunks, tokens, cfg.latent_dim)
             if tuple(target_latent.shape) != expected:
                 raise ValueError(f'target latent {tuple(target_latent.shape)} != {expected}')
             target_latent = target_latent.to(hidden.device)
@@ -1085,7 +1117,7 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
         # chunk k at step k -- which is why the rollout needs no second backbone pass.
         if cfg.predictor_mode == 'direct':
             hidden = hidden[future_mask].view(
-                hidden.shape[0], cfg.latent_chunks, tokens, hidden.shape[-1])
+                hidden.shape[0], chunks, tokens, hidden.shape[-1])
         elif cfg.predictor_mode == 'slice':
             hidden = self._gather_context_slices(hidden, video_token_mask,
                                                  kwargs.get('video_grid_thw'))
@@ -1101,7 +1133,7 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
                 z_pred = self.latent_head(flat).view(batch, chunks * tokens, cfg.latent_dim)
             else:
                 z_pred = self.latent_head(self.resampler(hidden, context_mask))
-            z_pred = z_pred.view(z_pred.shape[0], cfg.latent_chunks, tokens, cfg.latent_dim)
+            z_pred = z_pred.view(z_pred.shape[0], chunks, tokens, cfg.latent_dim)
             if cfg.prediction_mode == 'paired_residual' and cfg.residual_feedback:
                 # Chunk k on chunk k, so a chunk-count mismatch between context and
                 # target must stop the run: broadcasting or truncating here would train
@@ -1117,7 +1149,8 @@ class QwenVRAEFuturePredictor(PreTrainedModel):
                         f'{None if context_latent is None else tuple(context_latent.shape)}')
                 z_pred = context_latent.to(z_pred.device, z_pred.dtype) + z_pred
             losses = {} if target_latent is None else self.latent_losses(z_pred, target_latent)
-            return VRAEPredictorOutput(z_pred=z_pred, **losses)
+            return VRAEPredictorOutput(z_pred=z_pred, rollout_metrics=(
+                {'num_future_chunks': z_pred.new_tensor(chunks)} if variable_direct else None), **losses)
 
         if (context_latent is None or context_latent.ndim != 4 or context_latent.shape[1] < 1
                 or context_latent.shape[0] != hidden.shape[0]
@@ -1150,6 +1183,7 @@ class Qwen35VRAELoader(Qwen3_5Loader):
             predictor_mode=(os.environ.get('FUTURE_PREDICTOR_MODE')
                             or saved.get('predictor_mode') or 'resampler').lower(),
             prediction_mode=setting('prediction_mode', str, 'one_shot'),
+            direct_train_min_chunks=setting('direct_train_min_chunks', int, 0),
             rollout_steps=setting('rollout_steps', int, setting('latent_chunks', int, 10)),
             rollout_weight=setting('rollout_weight', float, 1.0),
             bptt_depth=setting('bptt_depth', int, setting('latent_chunks', int, 10)),
